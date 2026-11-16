@@ -6,6 +6,8 @@ x-app: &app
     REDIS_URL: redis://redis:6379/0
     JWT_SECRET: ${JWT_SECRET:-coldchain-demo-change-in-production-3102}
     SEED_DEMO: ${SEED_DEMO:-true}
+    RECEIVER_URL: http://receiver:7000
+    SYNC_RETRY_SECONDS: ${SYNC_RETRY_SECONDS:-3}
   volumes: [artifacts:/artifacts]
   depends_on:
     db: {condition: service_healthy}
@@ -26,6 +28,18 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
+  receiver:
+    build: ./receiver
+    container_name: ${COMPOSE_PROJECT_NAME:-coldchain-link}-receiver
+    environment:
+      RECEIVER_DB: /data/receiver.sqlite
+    ports: ["${RECEIVER_PORT:-17201}:7000"]
+    volumes: [receiverdata:/data]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:7000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
   redis:
     image: redis:7-alpine
     container_name: ${COMPOSE_PROJECT_NAME:-coldchain-link}-redis
@@ -40,6 +54,10 @@ services:
     <<: *app
     container_name: ${COMPOSE_PROJECT_NAME:-coldchain-link}-backend
     ports: ["${BACKEND_PORT:-19201}:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      receiver: {condition: service_started}
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -73,6 +91,7 @@ volumes:
   dbdata:
   redisdata:
   artifacts:
+  receiverdata:
 networks:
   default:
     ipam:

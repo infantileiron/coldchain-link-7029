@@ -1,6 +1,7 @@
 import os,json
 import redis
 from fastapi import APIRouter,Depends,HTTPException,Response
+from pydantic import BaseModel,Field
 from sqlalchemy.exc import IntegrityError
 from src.config.database import db
 from src.models.entities import User,Shipment,Sample,Study,Recommendation,Audit
@@ -8,6 +9,7 @@ from src.schemas.business import Login,ShipmentInput,SampleInput,StudyInput,Reco
 from src.middlewares.auth import current,editor,admin
 from src.utils.security import verify,token
 from src.services.business import audit,dump
+from src.services import sync
 from src.controllers.business import ensure_shipment,ensure_study,study_rows
 router=APIRouter()
 @router.post('/auth/login')
@@ -22,16 +24,21 @@ def ships(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Shi
 @router.post('/shipments')
 def ship(data:ShipmentInput,u=Depends(editor),s=Depends(db)):
  r=Shipment(**data.model_dump());s.add(r)
- try:s.commit()
+ try:
+  s.flush();sync.record_shipment_change(s,'创建班次',r);s.commit()
  except IntegrityError:s.rollback();raise HTTPException(409,'班次编号重复')
+ # 业务写入与待发送变更在同一事务内提交；接收端断线只影响 outbox 状态
+ sync.wake_dispatcher()
  audit(s,u,'创建班次 '+r.code);return dump(r)
 @router.get('/samples')
 def samples(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Sample).all()]
 @router.post('/samples')
 def sample(data:SampleInput,u=Depends(editor),s=Depends(db)):
  ensure_shipment(s,data.shipment_id);r=Sample(**data.model_dump());s.add(r)
- try:s.commit()
+ try:
+  s.flush();sync.record_sample_change(s,'录入样本',r);s.commit()
  except IntegrityError:s.rollback();raise HTTPException(409,'样本编号重复')
+ sync.wake_dispatcher()
  audit(s,u,'录入样本 '+r.code);return dump(r)
 @router.get('/studies')
 def studies(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Study).order_by(Study.id.desc()).all()]
@@ -67,16 +74,36 @@ def audits(u=Depends(admin),s=Depends(db)):return [dump(r) for r in s.query(Audi
 def edit_ship(i:int,data:ShipmentInput,u=Depends(editor),s=Depends(db)):
  row=s.get(Shipment,i)
  if not row:raise HTTPException(404,'班次不存在')
+ old=(row.route,row.zone)
  for k,v in data.model_dump().items():setattr(row,k,v)
- try:s.commit()
+ try:
+  s.flush();sync.record_shipment_change(s,'修改班次',row,old_route=old[0],old_zone=old[1]);s.commit()
  except IntegrityError:s.rollback();raise HTTPException(409,'班次编号重复')
+ sync.wake_dispatcher()
  audit(s,u,'修改班次 '+str(i));return dump(row)
 @router.put('/samples/{i}')
 def edit_sample(i:int,data:SampleInput,u=Depends(editor),s=Depends(db)):
  row=s.get(Sample,i)
  if not row:raise HTTPException(404,'样本不存在')
  ensure_shipment(s,data.shipment_id)
+ old=s.get(Shipment,row.shipment_id)
  for k,v in data.model_dump().items():setattr(row,k,v)
- try:s.commit()
+ try:
+  s.flush();sync.record_sample_change(s,'更正样本',row,old_shipment=old);s.commit()
  except IntegrityError:s.rollback();raise HTTPException(409,'样本编号重复')
+ sync.wake_dispatcher()
  audit(s,u,'修改样本 '+str(i));return dump(row)
+
+@router.get('/sync/status')
+def sync_status(u=Depends(current),s=Depends(db)):return sync.status_rows(s)
+class ResendInput(BaseModel):
+ keys:list[str]=Field(default_factory=list)
+@router.post('/sync/resend')
+def sync_resend(data:ResendInput,u=Depends(editor),s=Depends(db)):
+ done=[k for k in data.keys if sync.resend(k)]
+ if not done:raise HTTPException(409,'没有可补发的分组')
+ audit(s,u,'补发货损汇总 '+','.join(done));return {'resent':done}
+@router.post('/sync/drain')
+def sync_drain(u=Depends(editor)):
+ """演练辅助：立即尝试推送待发送变更；接收端离线时保留状态。"""
+ return {'sent':sync.drain(200)}

@@ -2,6 +2,7 @@ import random
 from src.config.database import Base,engine,Session
 from src.models.entities import User,Shipment,Sample
 from src.utils.security import hash_password
+from src.services import sync
 from sqlalchemy import func
 def seed():
  Base.metadata.create_all(engine);rng=random.Random(3102)
@@ -18,5 +19,9 @@ def seed():
    exposure=round(rng.uniform(3,85),1);loss=round(min(100,1+exposure*.11+rng.uniform(-.9,.9)),2)
    if i>=50:exposure=20
    if not s.query(Sample).filter_by(code=code+'-S').first():s.add(Sample(shipment_id=ship.id,code=code+'-S',exposure=None if i in (5,37) else exposure,excursions=int(exposure/10),loss=loss))
-  s.commit();print({'shipments':s.query(Shipment).count(),'samples':s.query(Sample).count(),'users':s.query(User).count()})
+  s.commit()
+  # 历史数据也要进入货损汇总：为尚无 outbox 记录的线路/温区补一份待发送快照
+  try:sync.backfill(s);s.commit()
+  except Exception:print('货损汇总回填跳过')
+  print({'shipments':s.query(Shipment).count(),'samples':s.query(Sample).count(),'users':s.query(User).count()})
 if __name__=='__main__':seed()
